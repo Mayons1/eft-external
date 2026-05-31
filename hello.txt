@@ -1,6 +1,6 @@
-import sys, struct
+import sys
 
-SIG_LEN  = b'\x5C\x06'
+SIG = bytes([0x5C, 0x06, 0x7D, 0x75, 0x16, 0xE0, 0x47, 0x00])
 STRUCT_SIZE = 3256
 
 def find_eeprom(path):
@@ -11,22 +11,19 @@ def find_eeprom(path):
     hits = []
     pos = 0
     while True:
-        # look for magic 0xA55A
-        pos = data.find(b'\x5A\xA5', pos)
+        pos = data.find(SIG, pos)
         if pos < 0:
             break
-        # validate EEP_LEN=0x065C at byte +0x200
-        if pos + 0x202 <= len(data):
-            if data[pos+0x200:pos+0x202] == SIG_LEN:
-                hits.append(pos)
-                print(f"  HIT at file offset {pos:#010x}")
+        hits.append(pos)
+        print(f"  HIT at file offset {pos:#010x}")
         pos += 1
 
     if not hits:
-        print("No hits found.")
+        print("No hits. Struct is probably above 2GB.")
+        print("Run: pcileech dump -out C:\\ar9280_dump\\physmem2.bin -min 0x80000000 -max 0x100000000")
     else:
         best = hits[0]
-        print(f"\nBest candidate: {best:#010x}")
+        print(f"\nBest: {best:#010x}")
         print(f"Run: pcileech dump -addr {best:#x} -length {STRUCT_SIZE} -out C:\\ar9280_dump\\eeprom_cached.bin")
 
 find_eeprom(sys.argv[1] if len(sys.argv) > 1 else r'C:\ar9280_dump\physmem.bin')
