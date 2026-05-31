@@ -1,0 +1,112 @@
+Raw EEPROM binary dump — three methods, fastest first
+Method 1 — check debugfs (30 seconds, probably already there)
+# On the Linux box with the real DW1525:
+ls /sys/kernel/debug/ieee80211/phy*/ath9k/
+# Look for a file named just 'eeprom' (raw binary, kernels 3.11+)
+# If it exists:
+cp /sys/kernel/debug/ieee80211/phy0/ath9k/eeprom /tmp/ar9280_eeprom.bin
+wc -c /tmp/ar9280_eeprom.bin   # should be 3256 bytes (1628 × 2)
+xxd /tmp/ar9280_eeprom.bin | head -20
+Method 2 — Python /dev/mem script (if debugfs raw file doesn't exist)
+Save as eeprom_dump.py, run as root:
+
+#!/usr/bin/env python3
+"""
+AR9280 full EEPROM dump via BAR0 /dev/mem.
+Walks all 1629 words (magic + 1628 struct words) and prints
+them as SystemVerilog case entries ready to paste into eep_word().
+
+Usage:
+  # Find BAR0 address first:
+  lspci -v -s 04:00.0 | grep "Memory at"
+  # Unbind driver so BAR0 is free:
+  echo "0000:04:00.0" > /sys/bus/pci/drivers/ath9k_pci/unbind
+  # Run:
+  python3 eeprom_dump.py 0xf7900000   # replace with your BAR0 address
+  # Re-bind:
+  echo "0000:04:00.0" > /sys/bus/pci/drivers/ath9k_pci/bind
+"""
+import mmap, struct, sys, time
+
+AR_EEPROM_OFFSET      = 0x2000   # base of EEPROM address window in BAR0
+AR_EEPROM_STATUS_DATA = 0x407C   # data/status register
+BUSY_MASK             = 0x00030000
+BAR0_SIZE             = 0x80000  # 512 KB
+
+def read_word(mm, word_addr):
+    reg = AR_EEPROM_OFFSET + (word_addr << 1)
+    mm[reg:reg+4] = struct.pack('<I', 0)          # trigger read
+    for _ in range(2000):                          # up to 2 ms
+        raw = struct.unpack('<I', mm[AR_EEPROM_STATUS_DATA:AR_EEPROM_STATUS_DATA+4])[0]
+        if not (raw & BUSY_MASK):
+            return raw & 0xFFFF
+        time.sleep(1e-6)
+    raise TimeoutError(f"timeout at word 0x{word_addr:04X}")
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit("usage: eeprom_dump.py <BAR0_phys_hex>")
+    bar0 = int(sys.argv[1], 0)
+
+    with open('/dev/mem', 'r+b') as f:
+        mm = mmap.mmap(f.fileno(), BAR0_SIZE, mmap.MAP_SHARED,
+                       mmap.PROT_READ | mmap.PROT_WRITE, offset=bar0)
+
+    results = {}
+    # Magic word outside struct (word 0x0000)
+    results[0x0000] = read_word(mm, 0x0000)
+    # Full ar5416_eeprom_def: words 0x0100..0x075B
+    for addr in range(0x0100, 0x0100 + 1628):
+        results[addr] = read_word(mm, addr)
+        if addr % 128 == 0:
+            print(f"// ... 0x{addr:04X}", file=sys.stderr, flush=True)
+
+    mm.close()
+
+    # ---- output 1: SystemVerilog case entries (non-zero only) ----
+    print("// paste into eep_word() — all non-zero non-default entries")
+    for addr, val in sorted(results.items()):
+        if val:
+            print(f"            16'h{addr:04X}: eep_word = 16'h{val:04X};")
+
+    # ---- output 2: raw binary ----
+    with open("eeprom_raw.bin", "wb") as out:
+        # word 0x0000 first, then 0x0100..0x075B
+        out.write(struct.pack('<H', results[0x0000]))
+        for addr in range(0x0100, 0x0100 + 1628):
+            out.write(struct.pack('<H', results[addr]))
+    print("// raw saved → eeprom_raw.bin (3258 bytes)", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()
+Method 3 — via PCILeech from the other machine
+If /dev/mem access is blocked by CONFIG_STRICT_DEVMEM:
+
+# From machine B (the one with your PCIeSquirrel):
+# Find BAR0 of the AR9280 in Machine A's memory by reading config space
+pcileech lspci   # find 168C:002A, note its BAR0 value from offset 0x10
+
+# Then dump BAR0 directly:
+pcileech dump -out bar0.bin -addr 0xf7900000 -length 0x80000
+
+# Then on Linux, extract EEPROM words from the dump with Python:
+python3 -c "
+import struct
+data = open('bar0.bin','rb').read()
+def rd32(off): return struct.unpack_from('<I', data, off)[0]
+# We can't trigger EEPROM reads from a snapshot, but we can read
+# the driver's cached struct from BAR0 if ath9k left values in it.
+# More useful: read physical memory where ath9k cached the EEPROM struct.
+"
+# For the actual EEPROM contents, read the kernel's ath_hw->eeprom.def
+# struct from Machine A's RAM — PCILeech gives you full physical memory access.
+What the raw dump gives you that we still don't have
+Once you run Method 1 or 2, you'll get the missing blocks:
+
+EEPROM region	Words	Content	Current state
+calFreqPier5G/2G	6	Center frequencies for cal	0x0000
+calPierData5G[2][8]	832	Per-freq TX power PD tables	0x0000
+calPierData2G[2][4]	416	Same for 2.4GHz	0x0000
+calTargetPower	128	Max TX power per rate	0x0000
+ctlData[24]	240	Regulatory TX limits	0x0000
+Those zeros don't cause ath9k to crash, but they do mean TX power is uncalibrated. For the emulation to be indistinguishable at the ath9k level, paste the output of the dump script directly into eep_word() replacing everything we have now — it'll be ~300 non-zero case entries covering the complete hardware truth.
